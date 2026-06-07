@@ -42,6 +42,7 @@
 </head>
 <body class="dark-theme">
     <div class="bg-animate"></div>
+    <div class="notification-container" id="notificationContainer"></div>
 
     <header>
         <div class="logo">
@@ -56,12 +57,12 @@
                 <li><a href="#userInsights">INSIGHTS</a></li>
             </ul>
         </nav>
+
         <div class="header-actions">
-            <div class="install-app-wrapper">
-                <button id="installAppBtn" class="install-app-btn" title="Install App">
-                    <i class="fas fa-download"></i>
-                    <span>INSTALL</span>
-                </button>
+            <div class="global-search-wrapper">
+                <i class="fas fa-search"></i>
+                <input type="text" id="globalSearch" placeholder="Search any city, location, or destination worldwide..." autocomplete="off">
+                <div class="autocomplete-dropdown" id="globalSearchDropdown"></div>
             </div>
             <div class="voice-toggle-wrapper">
                 <button id="voiceToggle" class="voice-btn active" title="Toggle Voice Assistant">
@@ -76,14 +77,9 @@
                     <span class="demo-text">🎤 DEMO MODE</span>
                 </label>
             </div>
-            <div class="city-selector-wrapper">
-                <i class="fas fa-city"></i>
-                <select id="citySelector" class="city-select">
-                    <option value="Kolkata">Kolkata Smart Grid</option>
-                    <option value="Mumbai">Mumbai Traffic Network</option>
-                    <option value="Delhi">Delhi Urban Flow</option>
-                </select>
-            </div>
+            <button id="gpsLocationBtn" class="gps-location-btn" title="Use my current location">
+                <i class="fas fa-location-arrow"></i>
+            </button>
             <div class="status-indicator" id="liveStatus">
                 <div class="live-dot"></div>
                 <span id="statusText">LIVE AI ANALYSIS ACTIVE</span>
@@ -149,16 +145,18 @@
                 <form id="predictionForm">
                     <div class="form-group">
                         <label>Start Location</label>
-                        <div class="input-container">
+                        <div class="input-container autocomplete-wrapper">
                             <i class="fas fa-map-marker-alt"></i>
                             <input type="text" id="location" placeholder="Search start area..." required>
+                            <div class="autocomplete-dropdown" id="locationAutocomplete"></div>
                         </div>
                     </div>
                     <div class="form-group">
                         <label>Destination</label>
-                        <div class="input-container">
+                        <div class="input-container autocomplete-wrapper">
                             <i class="fas fa-flag-checkered"></i>
                             <input type="text" id="destination" placeholder="Enter destination..." required>
+                            <div class="autocomplete-dropdown" id="destinationAutocomplete"></div>
                         </div>
                     </div>
                     <div class="form-group">
@@ -795,30 +793,32 @@
             showInstallButton();
         });
 
-        installAppBtn.addEventListener('click', async () => {
-            if (deferredPrompt) {
-                deferredPrompt.prompt();
-                const result = await deferredPrompt.userChoice;
-                if (result.outcome === 'accepted') {
-                    console.log('User accepted install prompt');
-                    // Show success message
-                    if (window.innerWidth <= 768) {
-                        alert('🎉 TrafficSense AI installed successfully!\n\nCheck your home screen for the app icon.');
+        if (installAppBtn) {
+            installAppBtn.addEventListener('click', async () => {
+                if (deferredPrompt) {
+                    deferredPrompt.prompt();
+                    const result = await deferredPrompt.userChoice;
+                    if (result.outcome === 'accepted') {
+                        console.log('User accepted install prompt');
+                        // Show success message
+                        if (window.innerWidth <= 768) {
+                            alert('🎉 TrafficSense AI installed successfully!\n\nCheck your home screen for the app icon.');
+                        }
                     }
+                    deferredPrompt = null;
+                    installAppBtn.classList.add('hidden');
+                } else {
+                    // Manual install instructions for mobile
+                    alert('📱 How to install TrafficSense AI:\n\n1. Tap menu (⋮) in browser\n2. Tap "Add to Home Screen" or "Install app"\n3. Confirm installation\n\nThe app will appear on your home screen!');
                 }
-                deferredPrompt = null;
-                installAppBtn.classList.add('hidden');
-            } else {
-                // Manual install instructions for mobile
-                alert('📱 How to install TrafficSense AI:\n\n1. Tap menu (⋮) in browser\n2. Tap "Add to Home Screen" or "Install app"\n3. Confirm installation\n\nThe app will appear on your home screen!');
-            }
-        });
+            });
 
-        // Hide install button if app is already installed
-        window.addEventListener('appinstalled', () => {
-            installAppBtn.classList.add('hidden');
-            console.log('PWA was installed');
-        });
+            // Hide install button if app is already installed
+            window.addEventListener('appinstalled', () => {
+                installAppBtn.classList.add('hidden');
+                console.log('PWA was installed');
+            });
+        }
 
         // Also show install button on desktop for testing
         if (window.innerWidth > 768) {

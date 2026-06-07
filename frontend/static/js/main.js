@@ -11,11 +11,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const saveRouteBtn = document.getElementById('saveRouteBtn');
     const historyList = document.getElementById('historyList');
     const favoritesList = document.getElementById('favoritesList');
-    const citySelector = document.getElementById('citySelector');
     const apiLabel = document.getElementById('apiLabel');
     const emergencyToggle = document.getElementById('emergencyToggle');
     const demoToggle = document.getElementById('demoToggle');
     const voiceToggle = document.getElementById('voiceToggle');
+    const globalSearchInput = document.getElementById('globalSearch');
+    const globalSearchDropdown = document.getElementById('globalSearchDropdown');
+    const gpsLocationBtn = document.getElementById('gpsLocationBtn');
     
     // New production features
     let currentLocationCoords = null;
@@ -23,6 +25,495 @@ document.addEventListener('DOMContentLoaded', () => {
     let accidentRiskData = null;
     let searchTimeout = null;
     let lastPredictionData = null; // Store last data for UI updates
+    let lastSearchedCoords = null;
+    let searchCache = new Map(); // Cache search results
+    let searchAbortController = null; // For aborting previous fetch requests
+    let autocompleteAbortController = null; // Separate controller for autocomplete
+    let latestSearchQuery = null; // To track the latest query string
+    let activeGeocodeRequests = new Set(); // Track active geocode requests for deduplication
+    let geocodeCallCount = 0; // Count geocode calls for audit
+    let analysisTriggered = false; // STRICT ANALYSIS LOCK - Only Initial Analysis button may set this to true
+    
+    // Function to mark results as outdated when inputs change
+    const markResultsAsOutdated = () => {
+        const predictionContent = document.getElementById('predictionContent');
+        if (!predictionContent || predictionContent.classList.contains('hidden')) {
+            return;
+        }
+        
+        const altRoute = document.getElementById('altRoute');
+        if (altRoute && !altRoute.innerHTML.includes('⚠️ OUTDATED')) {
+            altRoute.innerHTML = '<i class="fas fa-exclamation-triangle"></i> ⚠️ Results Outdated - Press "Initial Analysis" to refresh';
+            altRoute.style.color = '#f59e0b';
+            altRoute.style.fontWeight = '600';
+        }
+    };
+
+    // Shared Autocomplete Function
+    const setupAutocomplete = (input, dropdown, targetInputForMarker) => {
+        input.addEventListener('input', (e) => {
+            // PREVENT RECURSIVE LOOPS: Skip if this was triggered by autocomplete selection
+            if (input.getAttribute('data-autocomplete-selected') === 'true') {
+                return;
+            }
+            
+            // RESET ANALYSIS LOCK on input change
+            analysisTriggered = false;
+            markResultsAsOutdated();
+            
+            const query = e.target.value.trim();
+            dropdown.innerHTML = ''; // Clear old results immediately
+            if (query.length < 2) {
+                dropdown.classList.remove('show');
+                return;
+            }
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => performAutocompleteSearch(query, input, dropdown, targetInputForMarker), 200);
+        });
+
+        // Hide dropdown when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!input.contains(e.target) && !dropdown.contains(e.target)) {
+                dropdown.classList.remove('show');
+            }
+        });
+    };
+
+    const performAutocompleteSearch = async (query, input, dropdown, targetInput) => {
+        const startTime = performance.now();
+        const cacheKey = query.toLowerCase();
+        latestSearchQuery = query;
+        
+        // REQUEST DEDUPLICATION: Check if same query is already running
+        if (activeGeocodeRequests.has(query)) {
+            console.log('[GEOCODE DEDUP] Query already running, skipping:', query);
+            return;
+        }
+        
+        // Abort any existing autocomplete search (not global search)
+        if (autocompleteAbortController) {
+            autocompleteAbortController.abort();
+        }
+        
+        // Add to active requests
+        activeGeocodeRequests.add(query);
+        geocodeCallCount++;
+        console.log(`[GEOCODE AUDIT] Call #${geocodeCallCount}: ${query}`);
+        
+        // Show loading indicator
+        dropdown.innerHTML = '<div class="autocomplete-item"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
+        dropdown.classList.add('show');
+        
+        // Check cache first
+        if (searchCache.has(cacheKey)) {
+            const cachedData = searchCache.get(cacheKey);
+            if (latestSearchQuery === query) { // Only update if still latest query
+                renderAutocompleteResults(cachedData, input, dropdown, targetInput);
+            }
+            activeGeocodeRequests.delete(query);
+            console.log(`[GEOCODE TIMING] Cache hit for "${query}": ${(performance.now() - startTime).toFixed(2)}ms`);
+            return;
+        }
+        
+        // Create new AbortController for this search
+        autocompleteAbortController = new AbortController();
+        const signal = autocompleteAbortController.signal;
+        
+        try {
+            const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`, { signal });
+            const data = await response.json();
+            
+            // Check if this is still the latest query before updating UI
+            if (latestSearchQuery !== query) {
+                activeGeocodeRequests.delete(query);
+                return;
+            }
+            
+            if (data.error) {
+                dropdown.classList.remove('show');
+                activeGeocodeRequests.delete(query);
+                return;
+            }
+
+            // Cache the results (expire after 5 minutes)
+            searchCache.set(cacheKey, data);
+            setTimeout(() => {
+                if (searchCache.has(cacheKey)) {
+                    searchCache.delete(cacheKey);
+                }
+            }, 300000); // 5 minutes cache
+
+            renderAutocompleteResults(data, input, dropdown, targetInput);
+            console.log(`[GEOCODE TIMING] Autocomplete search for "${query}": ${(performance.now() - startTime).toFixed(2)}ms`);
+        } catch (error) {
+            if (error.name !== 'AbortError') { // Ignore abort errors
+                console.error('Autocomplete search error:', error);
+            }
+        } finally {
+            activeGeocodeRequests.delete(query);
+        }
+    };
+
+    const renderAutocompleteResults = (data, input, dropdown, targetInput) => {
+        // Remove existing event listeners to prevent duplication
+        dropdown.querySelectorAll('.autocomplete-item').forEach(item => {
+            item.replaceWith(item.cloneNode(true));
+        });
+        
+        let html = '';
+        data.results.forEach((result) => {
+            html += `
+                <div class="autocomplete-item" 
+                     data-lat="${result.lat}" 
+                     data-lon="${result.lon}" 
+                     data-name="${result.display_name}" 
+                     data-place-id="${result.place_id || ''}" 
+                     data-source="${result.source || ''}"
+                     data-place-name="${result.place_name || result.display_name.split(',')[0]}">
+                    <i class="fas fa-map-marker-alt"></i>
+                    <div>
+                        <div class="autocomplete-name">${result.display_name.split(',')[0]}</div>
+                        <div class="autocomplete-region">${result.display_name.split(',').slice(1).join(', ')}</div>
+                    </div>
+                </div>
+            `;
+        });
+        
+        dropdown.innerHTML = html;
+        dropdown.classList.add('show');
+
+        // Add click event listeners to items (only once, since we cloned nodes)
+        dropdown.querySelectorAll('.autocomplete-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const name = item.getAttribute('data-name');
+                const lat = parseFloat(item.getAttribute('data-lat'));
+                const lon = parseFloat(item.getAttribute('data-lon'));
+                const placeId = item.getAttribute('data-place-id');
+                const source = item.getAttribute('data-source');
+                const placeName = item.getAttribute('data-place-name');
+                
+                lastSearchedCoords = { lat, lon };
+                
+                // LOG: Selected place information
+                console.log('[AUTOCOMPLETE SELECT] Selected Place:');
+                console.log('[AUTOCOMPLETE SELECT] Display Name:', name);
+                console.log('[AUTOCOMPLETE SELECT] Latitude:', lat);
+                console.log('[AUTOCOMPLETE SELECT] Longitude:', lon);
+                console.log('[AUTOCOMPLETE SELECT] Place ID:', placeId);
+                console.log('[AUTOCOMPLETE SELECT] Source:', source);
+                console.log('[AUTOCOMPLETE SELECT] Place Name:', placeName);
+                
+                // Set flag to prevent input event from triggering autocomplete
+                targetInput.setAttribute('data-autocomplete-selected', 'true');
+                targetInput.value = name;
+                targetInput.setAttribute('data-coords', `${lat},${lon}`);
+                targetInput.setAttribute('data-place-id', placeId);
+                targetInput.setAttribute('data-source', source);
+                targetInput.setAttribute('data-place-name', placeName);
+                
+                // RESET ANALYSIS LOCK on autocomplete selection (input value changed)
+                analysisTriggered = false;
+                markResultsAsOutdated();
+                
+                // Update map marker (DO NOT trigger route generation - analysis lock)
+                if (map && startMarker && endMarker) {
+                    if (targetInput === locationInput) {
+                        startMarker.setLatLng([lat, lon]);
+                    } else {
+                        endMarker.setLatLng([lat, lon]);
+                    }
+                    // REMOVED: updateRouteFromMarkers(true); - Analysis lock prevents automatic route generation
+                    map.flyTo([lat, lon], 13);
+                } else if (map) {
+                    map.flyTo([lat, lon], 13);
+                }
+                
+                apiLabel.textContent = `Connected to: Global Traffic Intelligence`;
+                
+                dropdown.classList.remove('show');
+                
+                // Reset flag after a short delay
+                setTimeout(() => {
+                    targetInput.removeAttribute('data-autocomplete-selected');
+                }, 100);
+            });
+        });
+    };
+
+    // Global search with Nominatim API
+    if (globalSearchInput && globalSearchDropdown) {
+        globalSearchInput.addEventListener('input', (e) => {
+            const query = e.target.value.trim();
+            globalSearchDropdown.innerHTML = ''; // Clear old results immediately
+            if (query.length < 2) {
+                globalSearchDropdown.classList.remove('show');
+                return;
+            }
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => performGlobalSearch(query), 500);
+        });
+    }
+
+    const performGlobalSearch = async (query) => {
+        const startTime = performance.now();
+        const cacheKey = query.toLowerCase();
+        latestSearchQuery = query;
+        
+        // REQUEST DEDUPLICATION: Check if same query is already running
+        if (activeGeocodeRequests.has(query)) {
+            console.log('[GEOCODE DEDUP] Query already running, skipping:', query);
+            return;
+        }
+        
+        // Abort any existing global search (not autocomplete)
+        if (searchAbortController) {
+            searchAbortController.abort();
+        }
+        
+        // Add to active requests
+        activeGeocodeRequests.add(query);
+        geocodeCallCount++;
+        console.log(`[GEOCODE AUDIT] Call #${geocodeCallCount}: ${query}`);
+        
+        // Show loading indicator
+        globalSearchDropdown.innerHTML = '<div class="autocomplete-item"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
+        globalSearchDropdown.classList.add('show');
+        
+        // Check cache first
+        if (searchCache.has(cacheKey)) {
+            const cachedData = searchCache.get(cacheKey);
+            if (latestSearchQuery === query) { // Only update if still latest query
+                renderGlobalSearchResults(cachedData);
+            }
+            activeGeocodeRequests.delete(query);
+            console.log(`[GEOCODE TIMING] Cache hit for "${query}": ${(performance.now() - startTime).toFixed(2)}ms`);
+            return;
+        }
+        
+        // Create new AbortController for this search
+        searchAbortController = new AbortController();
+        const signal = searchAbortController.signal;
+        
+        try {
+            const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`, { signal });
+            const data = await response.json();
+            
+            // Check if this is still the latest query before updating UI
+            if (latestSearchQuery !== query) {
+                activeGeocodeRequests.delete(query);
+                return;
+            }
+            
+            if (data.error) {
+                globalSearchDropdown.classList.remove('show');
+                activeGeocodeRequests.delete(query);
+                return;
+            }
+
+            searchCache.set(cacheKey, data);
+            setTimeout(() => { searchCache.delete(cacheKey); }, 300000);
+            renderGlobalSearchResults(data);
+            console.log(`[GEOCODE TIMING] Global search for "${query}": ${(performance.now() - startTime).toFixed(2)}ms`);
+        } catch (error) {
+            if (error.name !== 'AbortError') { // Ignore abort errors
+                console.error('Global search error:', error);
+            }
+        } finally {
+            activeGeocodeRequests.delete(query);
+        }
+    };
+
+    const renderGlobalSearchResults = (data) => {
+        // Remove existing event listeners to prevent duplication
+        globalSearchDropdown.querySelectorAll('.autocomplete-item').forEach(item => {
+            item.replaceWith(item.cloneNode(true));
+        });
+        
+        let html = '';
+        data.results.forEach((result) => {
+            html += `
+                <div class="autocomplete-item" 
+                     data-lat="${result.lat}" 
+                     data-lon="${result.lon}" 
+                     data-name="${result.display_name}" 
+                     data-place-id="${result.place_id || ''}" 
+                     data-source="${result.source || ''}"
+                     data-place-name="${result.place_name || result.display_name.split(',')[0]}">
+                    <i class="fas fa-map-marker-alt"></i>
+                    <div>
+                        <div class="autocomplete-name">${result.display_name.split(',')[0]}</div>
+                        <div class="autocomplete-region">${result.display_name.split(',').slice(1).join(', ')}</div>
+                    </div>
+                </div>
+            `;
+        });
+        
+        globalSearchDropdown.innerHTML = html;
+        globalSearchDropdown.classList.add('show');
+
+        globalSearchDropdown.querySelectorAll('.autocomplete-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const name = item.getAttribute('data-name');
+                const lat = parseFloat(item.getAttribute('data-lat'));
+                const lon = parseFloat(item.getAttribute('data-lon'));
+                const placeId = item.getAttribute('data-place-id');
+                const source = item.getAttribute('data-source');
+                const placeName = item.getAttribute('data-place-name');
+                
+                lastSearchedCoords = { lat, lon };
+                
+                // LOG: Selected place information
+                console.log('[AUTOCOMPLETE SELECT] Selected Place:');
+                console.log('[AUTOCOMPLETE SELECT] Display Name:', name);
+                console.log('[AUTOCOMPLETE SELECT] Latitude:', lat);
+                console.log('[AUTOCOMPLETE SELECT] Longitude:', lon);
+                console.log('[AUTOCOMPLETE SELECT] Place ID:', placeId);
+                console.log('[AUTOCOMPLETE SELECT] Source:', source);
+                console.log('[AUTOCOMPLETE SELECT] Place Name:', placeName);
+                
+                let targetInput;
+                if (document.activeElement === destinationInput) {
+                    targetInput = destinationInput;
+                } else if (document.activeElement === locationInput) {
+                    targetInput = locationInput;
+                } else if (!locationInput.value) {
+                    targetInput = locationInput;
+                } else if (!destinationInput.value) {
+                    targetInput = destinationInput;
+                } else {
+                    targetInput = locationInput;
+                }
+                
+                // Set flag to prevent input event from triggering autocomplete
+                targetInput.setAttribute('data-autocomplete-selected', 'true');
+                targetInput.value = name;
+                targetInput.setAttribute('data-coords', `${lat},${lon}`);
+                targetInput.setAttribute('data-place-id', placeId);
+                targetInput.setAttribute('data-source', source);
+                targetInput.setAttribute('data-place-name', placeName);
+                
+                // RESET ANALYSIS LOCK on global search selection (input value changed)
+                analysisTriggered = false;
+                markResultsAsOutdated();
+                
+                if (map && startMarker && endMarker) {
+                    if (targetInput === locationInput) {
+                        startMarker.setLatLng([lat, lon]);
+                    } else {
+                        endMarker.setLatLng([lat, lon]);
+                    }
+                    // REMOVED: updateRouteFromMarkers(true); - Analysis lock prevents automatic route generation
+                    map.flyTo([lat, lon], 13);
+                } else if (map) {
+                    map.flyTo([lat, lon], 13);
+                }
+                
+                apiLabel.textContent = `Connected to: Global Traffic Intelligence`;
+                
+                globalSearchInput.value = '';
+                globalSearchDropdown.classList.remove('show');
+                
+                // Reset flag after a short delay
+                setTimeout(() => {
+                    targetInput.removeAttribute('data-autocomplete-selected');
+                }, 100);
+            });
+        });
+    };
+
+    // Setup autocomplete for location and destination inputs
+    const locationAutocomplete = document.getElementById('locationAutocomplete');
+    const destinationAutocomplete = document.getElementById('destinationAutocomplete');
+    
+    if (locationInput && locationAutocomplete) {
+        setupAutocomplete(locationInput, locationAutocomplete, locationInput);
+    }
+    if (destinationInput && destinationAutocomplete) {
+        setupAutocomplete(destinationInput, destinationAutocomplete, destinationInput);
+    }
+
+    // GPS location button handler
+    if (gpsLocationBtn) {
+        gpsLocationBtn.addEventListener('click', () => {
+            if (navigator.geolocation) {
+                gpsLocationBtn.style.animation = 'pulse-api 0.5s ease infinite';
+                
+                navigator.geolocation.getCurrentPosition(
+                    async (position) => {
+                        gpsLocationBtn.style.animation = '';
+                        const lat = position.coords.latitude;
+                        const lon = position.coords.longitude;
+                        currentLocationCoords = { lat, lon };
+                        
+                        try {
+                            const response = await fetch(`/api/reverse_geocode?lat=${lat}&lon=${lon}`);
+                            const data = await response.json();
+                            
+                            let address;
+                            if (data.structured_address) {
+                                const parts = [
+                                    data.structured_address.village_locality,
+                                    data.structured_address.area,
+                                    data.structured_address.city,
+                                    data.structured_address.district,
+                                    data.structured_address.state,
+                                    data.structured_address.country
+                                ].filter(Boolean);
+                                address = parts.join(', ');
+                            } else {
+                                address = data.display_name;
+                            }
+                            
+                            let targetInput;
+                            if (document.activeElement === destinationInput) {
+                                targetInput = destinationInput;
+                            } else if (document.activeElement === locationInput) {
+                                targetInput = locationInput;
+                            } else if (!locationInput.value) {
+                                targetInput = locationInput;
+                            } else if (!destinationInput.value) {
+                                targetInput = destinationInput;
+                            } else {
+                                targetInput = locationInput;
+                            }
+                            
+                            targetInput.value = address;
+                            targetInput.setAttribute('data-coords', `${lat},${lon}`);
+                            
+                            // RESET ANALYSIS LOCK on GPS location selection (input value changed)
+                            analysisTriggered = false;
+                            markResultsAsOutdated();
+                            
+                            if (map && startMarker && endMarker) {
+                                if (targetInput === locationInput) {
+                                    startMarker.setLatLng([lat, lon]);
+                                } else {
+                                    endMarker.setLatLng([lat, lon]);
+                                }
+                                // REMOVED: updateRouteFromMarkers(true); - Analysis lock prevents automatic route generation
+                                map.flyTo([lat, lon], 14);
+                            } else if (map) {
+                                map.flyTo([lat, lon], 14);
+                            }
+                            
+                            apiLabel.textContent = `Connected to: GPS Live Location`;
+                            speak('Current location detected');
+                        } catch (error) {
+                            console.error('Reverse geocoding error:', error);
+                        }
+                    },
+                    (error) => {
+                        gpsLocationBtn.style.animation = '';
+                        console.error('Geolocation error:', error);
+                        speak('Unable to detect your location');
+                    },
+                    { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
+                );
+            } else {
+                speak('Geolocation not supported on your device');
+            }
+        });
+    }
 
     let trafficChart;
     let map;
@@ -99,6 +590,48 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
+    // Notification System
+    const showNotification = (type, title, message, icon = 'info-circle') => {
+        const container = document.getElementById('notificationContainer');
+        if (!container) return;
+
+        const notification = document.createElement('div');
+        notification.className = `notification ${type}`;
+        notification.innerHTML = `
+            <i class="fas fa-${icon} notification-icon"></i>
+            <div class="notification-content">
+                <div class="notification-title">${title}</div>
+                <div class="notification-message">${message}</div>
+            </div>
+            <button class="notification-close"><i class="fas fa-times"></i></button>
+        `;
+
+        container.appendChild(notification);
+
+        // Close button
+        const closeBtn = notification.querySelector('.notification-close');
+        closeBtn.addEventListener('click', () => {
+            removeNotification(notification);
+        });
+
+        // Auto remove after 5 seconds
+        setTimeout(() => {
+            removeNotification(notification);
+        }, 5000);
+
+        // Speak notification if voice is enabled
+        if (isVoiceEnabled) {
+            speak(`${title}: ${message}`);
+        }
+    };
+
+    const removeNotification = (notification) => {
+        notification.style.animation = 'slideOut 0.3s ease-out';
+        setTimeout(() => {
+            notification.remove();
+        }, 300);
+    };
+
     // 1. SINGLE SOURCE OF TRUTH (Centralized Traffic State Manager)
     let trafficState = { 
         level: 'medium',   // only: low, medium, high 
@@ -163,31 +696,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return normalized;
     };
 
-    const cityConfigs = {
-        'Kolkata': { coords: [22.5726, 88.3639], api: 'Kolkata Traffic Control API' },
-        'Mumbai': { coords: [19.0760, 72.8777], api: 'Mumbai Urban Transit Data' },
-        'Delhi': { coords: [28.6139, 77.2090], api: 'Delhi Smart City Grid' }
-    };
 
-    // City Selector Logic
-    citySelector.onchange = (e) => {
-        const city = e.target.value;
-        const config = cityConfigs[city];
-        
-        // Update Map
-        map.flyTo(config.coords, 13);
-        startMarker.setLatLng(config.coords);
-        endMarker.setLatLng([config.coords[0] + 0.02, config.coords[1] + 0.04]);
-        
-        updateRouteFromMarkers();
-        
-        // Update API Label
-        apiLabel.innerHTML = `Connected to: ${config.api} (Simulated)`;
-        
-        // Visual feedback
-        apiLabel.style.color = 'var(--low-traffic)';
-        setTimeout(() => apiLabel.style.color = 'var(--accent-gold)', 2000);
-    };
 
     // Emergency Mode Logic
     emergencyToggle.onchange = (e) => {
@@ -289,10 +798,25 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // ✅ REAL PLACE SEARCH WITH NOMINATIM API
     const searchPlaces = async (query, limit = 5) => {
+        const cacheKey = `place-${query.toLowerCase()}-${limit}`;
+        if (searchCache.has(cacheKey)) {
+            return searchCache.get(cacheKey);
+        }
+        
         try {
             const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}&limit=${limit}`);
             const data = await response.json();
-            return data.results || [];
+            const results = data.results || [];
+            
+            // Cache for 5 minutes
+            searchCache.set(cacheKey, results);
+            setTimeout(() => {
+                if (searchCache.has(cacheKey)) {
+                    searchCache.delete(cacheKey);
+                }
+            }, 300000);
+            
+            return results;
         } catch (error) {
             console.error('Search failed:', error);
             return [];
@@ -323,100 +847,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return null;
         }
     };
-    
-    // ✅ AUTOCOMPLETE FUNCTIONALITY
-    const setupAutocomplete = (inputElement, type) => {
-        let resultsContainer = null;
-        
-        const createResultsContainer = () => {
-            resultsContainer = document.createElement('div');
-            resultsContainer.className = 'autocomplete-results';
-            resultsContainer.style.cssText = `
-                position: absolute;
-                top: 100%;
-                left: 0;
-                right: 0;
-                background: var(--glass-bg);
-                border: 1px solid var(--glass-border);
-                border-radius: 8px;
-                margin-top: 4px;
-                max-height: 200px;
-                overflow-y: auto;
-                z-index: 1000;
-                backdrop-filter: blur(10px);
-                display: none;
-            `;
-            inputElement.parentElement.style.position = 'relative';
-            inputElement.parentElement.appendChild(resultsContainer);
-        };
-        
-        const showResults = (results) => {
-            if (!resultsContainer) createResultsContainer();
-            
-            resultsContainer.innerHTML = '';
-            results.forEach(result => {
-                const item = document.createElement('div');
-                item.className = 'autocomplete-item';
-                item.style.cssText = `
-                    padding: 12px 16px;
-                    cursor: pointer;
-                    border-bottom: 1px solid rgba(255,255,255,0.05);
-                    transition: background 0.2s;
-                    font-size: 0.9rem;
-                    color: var(--text-primary);
-                `;
-                item.innerHTML = `
-                    <div style="font-weight: 500; margin-bottom: 2px;">${result.display_name.split(',')[0]}</div>
-                    <div style="font-size: 0.8rem; opacity: 0.7;">${result.display_name}</div>
-                `;
-                
-                item.addEventListener('mouseenter', () => {
-                    item.style.background = 'rgba(212, 175, 55, 0.1)';
-                });
-                
-                item.addEventListener('mouseleave', () => {
-                    item.style.background = 'transparent';
-                });
-                
-                item.addEventListener('click', () => {
-                    inputElement.value = result.display_name;
-                    inputElement.setAttribute('data-coords', `${result.lat},${result.lon}`);
-                    resultsContainer.style.display = 'none';
-                    
-                    // Trigger route update if both inputs have values
-                    if (locationInput.value && destinationInput.value) {
-                        updateRouteFromSearch();
-                    }
-                });
-                
-                resultsContainer.appendChild(item);
-            });
-            
-            resultsContainer.style.display = results.length > 0 ? 'block' : 'none';
-        };
-        
-        inputElement.addEventListener('input', async (e) => {
-            const query = e.target.value.trim();
-            
-            if (query.length < 2) {
-                if (resultsContainer) resultsContainer.style.display = 'none';
-                return;
-            }
-            
-            clearTimeout(searchTimeout);
-            searchTimeout = setTimeout(async () => {
-                const results = await searchPlaces(query);
-                showResults(results);
-            }, 300);
-        });
-        
-        // Hide results when clicking outside
-        document.addEventListener('click', (e) => {
-            if (!inputElement.contains(e.target) && (!resultsContainer || !resultsContainer.contains(e.target))) {
-                if (resultsContainer) resultsContainer.style.display = 'none';
-            }
-        });
-    };
+
     
     // ✅ USE CURRENT LOCATION BUTTON
     const addCurrentLocationButton = () => {
@@ -472,10 +903,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 locationInput.value = address;
                 locationInput.setAttribute('data-coords', `${coords.lat},${coords.lon}`);
                 
+                // RESET ANALYSIS LOCK on current location selection (input value changed)
+                analysisTriggered = false;
+                markResultsAsOutdated();
+                
                 // Update map marker
                 if (startMarker) {
                     startMarker.setLatLng([coords.lat, coords.lon]);
-                    updateRouteFromMarkers(true);
+                    // REMOVED: updateRouteFromMarkers(true); - Analysis lock prevents automatic route generation
                     map.flyTo([coords.lat, coords.lon], 15);
                 }
                 
@@ -521,7 +956,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (startMarker && endMarker) {
                 startMarker.setLatLng([startLat, startLon]);
                 endMarker.setLatLng([endLat, endLon]);
-                updateRouteFromMarkers(true);
+                // REMOVED: updateRouteFromMarkers(true); - Analysis lock prevents automatic route generation
             }
             
             // Get weather data for start location
@@ -665,8 +1100,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (data.accident_risk && data.accident_risk.level === 'high') latency += 15;
         document.getElementById('avgLatency').textContent = `${latency} min`;
         
-        // Route performance (inverse of congestion)
-        const routePerformance = 100 - congestionScore + Math.random() * 10;
+        // Route performance (inverse of congestion, fixed value)
+        const routePerformance = 100 - congestionScore + 5;
         document.getElementById('routePerformance').textContent = `${Math.round(routePerformance)}%`;
         
         // Emergency priority status
@@ -828,8 +1263,6 @@ document.addEventListener('DOMContentLoaded', () => {
      };
     
     // Initialize autocomplete and current location
-    setupAutocomplete(locationInput, 'start');
-    setupAutocomplete(destinationInput, 'destination');
     addCurrentLocationButton();
     
     // Load last used location if available and recent
@@ -853,6 +1286,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const el = document.getElementById('routeMetrics');
         if (!el) return;
         
+        // If distance/time are not valid, show calculating state
+        if (distance == null || time == null) {
+            el.textContent = 'Calculating route...';
+            return;
+        }
+        
         // Smooth Number Change (Micro Animation)
         const oldContent = el.textContent;
         const oldTimeMatch = oldContent.match(/(\d+)\smin/);
@@ -875,7 +1314,7 @@ document.addEventListener('DOMContentLoaded', () => {
         el.classList.add('metrics-update-glow');
     };
 
-    const getRouteName = (route) => {
+    const getRouteName = (route, index = 0) => {
         if (route.name) return route.name;
         if (route.instructions && route.instructions.length > 0) {
             // Extract unique road names, filter short/invalid names
@@ -886,113 +1325,112 @@ document.addEventListener('DOMContentLoaded', () => {
             
             if (uniqueRoads.length > 0) return uniqueRoads.join(' via ');
         }
-        // Fallback realistic names
+        // Fallback realistic names based on index
         const fallbacks = ["NH Route", "City Bypass", "Urban Link Road"];
-        return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        return fallbacks[index % fallbacks.length];
     };
 
     // 3. HARD LOCK AI DECISION ENGINE (Strict Logic)
     const updateAISuggestionUI = () => {
-        // 6. MICRO DELAY ENGINE (REALISM)
-        setTimeout(() => {
-            const suggestEl = document.getElementById('altRoute');
-            const routes = trafficState.routes;
-            if (!suggestEl || !routes || routes.length === 0) return;
+        // Removed setTimeout for performance - execute directly
+        const suggestEl = document.getElementById('altRoute');
+        const routes = trafficState.routes;
+        if (!suggestEl || !routes || routes.length === 0) return;
 
-            // SMART AUTO-SWITCH THRESHOLD (10% improvement rule)
-            const mainRoute = routes[0];
-            const currentSelected = routes[trafficState.selectedRouteIndex];
-            
-            const bestRouteIdx = routes.reduce((best, r, i, arr) => {
-                return r.time < arr[best].time ? i : best;
-            }, 0);
-            
-            const bestRoute = routes[bestRouteIdx];
-            
-            // ✅ Fix: Sync Stability with Traffic Level
-            trafficState.stability = trafficState.level === 'high' ? 'LOW' : (trafficState.level === 'medium' ? 'MODERATE' : 'HIGH');
+        // SMART AUTO-SWITCH THRESHOLD (10% improvement rule)
+        const mainRoute = routes[0];
+        const currentSelected = routes[trafficState.selectedRouteIndex];
+        
+        const bestRouteIdx = routes.reduce((best, r, i, arr) => {
+            return r.time < arr[best].time ? i : best;
+        }, 0);
+        
+        const bestRoute = routes[bestRouteIdx];
+        
+        // ✅ Fix: Sync Stability with Traffic Level
+        trafficState.stability = trafficState.level === 'high' ? 'LOW' : (trafficState.level === 'medium' ? 'MODERATE' : 'HIGH');
 
-            // Logic for route switching: must be 10% faster to switch automatically
-            const improvementThreshold = 0.90; // 10% faster
-            if (bestRoute.time < currentSelected.time * improvementThreshold) {
-                // If high confidence (>85%), lock current decision
-                if (trafficState.confidence <= 85 || isDemoMode) {
-                    trafficState.selectedRouteIndex = bestRouteIdx;
-                }
+        // Logic for route switching: must be 10% faster to switch automatically
+        const improvementThreshold = 0.90; // 10% faster
+        if (bestRoute.time < currentSelected.time * improvementThreshold) {
+            // If high confidence (>85%), lock current decision
+            if (trafficState.confidence <= 85 || isDemoMode) {
+                trafficState.selectedRouteIndex = bestRouteIdx;
             }
+        }
 
-            const activeRoute = routes[trafficState.selectedRouteIndex];
-            const mainName = mainRoute.name || 'Main Route';
-            const bestName = activeRoute.name || 'Optimal Route';
-            
-            const timeDiff = mainRoute.time - activeRoute.time;
-            const efficiency = mainRoute.time > 0 ? Math.round((timeDiff / mainRoute.time) * 100) : 0;
+        const activeRoute = routes[trafficState.selectedRouteIndex];
+        const mainName = mainRoute.name || 'Main Route';
+        const bestName = activeRoute.name || 'Optimal Route';
+        
+        const timeDiff = mainRoute.time - activeRoute.time;
+        const efficiency = mainRoute.time > 0 ? Math.round((timeDiff / mainRoute.time) * 100) : 0;
 
-            let situation = '';
-            let action = '';
-            let impact = '';
-            let badge = '';
+        let situation = '';
+        let action = '';
+        let impact = '';
+        let badge = '';
 
-            // 4. HUMAN-LIKE AI MESSAGING (Story-Driven)
-            if (trafficState.level === 'low') {
-                situation = "Smooth traffic flow detected across the primary grid.";
-                action = `Maintain current course via ${mainName}. It remains the most efficient path.`;
-                impact = "Zero congestion latency. Optimal fuel efficiency maintained.";
-                badge = efficiency > 10 ? `<span class="efficiency-badge">${efficiency}% faster</span>` : '';
-            } else if (trafficState.level === 'medium') {
-                situation = "Moderate congestion building up in the central corridors.";
-                if (timeDiff >= 5) {
-                    action = `Adaptive routing suggests switching to ${bestName} to bypass minor delays.`;
-                    impact = `Estimated saving of ${timeDiff} minutes (${efficiency}% faster).`;
-                    badge = `<span class="efficiency-badge highlight">${efficiency}% faster</span>`;
-                } else {
-                    action = `Main route via ${mainName} is still viable despite building density.`;
-                    impact = "Current path stability is high. Rerouting not required.";
-                }
-            } else if (trafficState.level === 'high') {
-                situation = "Severe congestion gridlock detected in the main sector.";
-                action = `Immediate rerouting via ${bestName} is recommended to avoid heavy delays.`;
-                impact = `Saves approximately ${timeDiff} minutes. Congestion override active.`;
-                badge = efficiency > 0 ? `<span class="efficiency-badge critical">${efficiency}% faster</span>` : `<span class="efficiency-badge critical">Gridlock Warning</span>`;
+        // 4. HUMAN-LIKE AI MESSAGING (Story-Driven)
+        if (trafficState.level === 'low') {
+            situation = "Smooth traffic flow detected across the primary grid.";
+            action = `Maintain current course via ${mainName}. It remains the most efficient path.`;
+            impact = "Zero congestion latency. Optimal fuel efficiency maintained.";
+            badge = efficiency > 10 ? `<span class="efficiency-badge">${efficiency}% faster</span>` : '';
+        } else if (trafficState.level === 'medium') {
+            situation = "Moderate congestion building up in the central corridors.";
+            if (timeDiff >= 5) {
+                action = `Adaptive routing suggests switching to ${bestName} to bypass minor delays.`;
+                impact = `Estimated saving of ${timeDiff} minutes (${efficiency}% faster).`;
+                badge = `<span class="efficiency-badge highlight">${efficiency}% faster</span>`;
+            } else {
+                action = `Main route via ${mainName} is still viable despite building density.`;
+                impact = "Current path stability is high. Rerouting not required.";
             }
+        } else if (trafficState.level === 'high') {
+            situation = "Severe congestion gridlock detected in the main sector.";
+            action = `Immediate rerouting via ${bestName} is recommended to avoid heavy delays.`;
+            impact = `Saves approximately ${timeDiff} minutes. Congestion override active.`;
+            badge = efficiency > 0 ? `<span class="efficiency-badge critical">${efficiency}% faster</span>` : `<span class="efficiency-badge critical">Gridlock Warning</span>`;
+        }
 
-            // EMERGENCY OVERRIDE
-            if (isEmergencyMode) {
-                situation = "Emergency vehicle detected. Prioritizing clear-path routing.";
-                action = `Switching to absolute fastest path via ${bestName}.`;
-                impact = "Emergency Priority Protocol: Bypassing all non-essential traffic nodes.";
-                badge = `<span class="efficiency-badge critical">EMERGENCY ACTIVE</span>`;
-            }
+        // EMERGENCY OVERRIDE
+        if (isEmergencyMode) {
+            situation = "Emergency vehicle detected. Prioritizing clear-path routing.";
+            action = `Switching to absolute fastest path via ${bestName}.`;
+            impact = "Emergency Priority Protocol: Bypassing all non-essential traffic nodes.";
+            badge = `<span class="efficiency-badge critical">EMERGENCY ACTIVE</span>`;
+        }
 
-            // Confidence Badge Logic
-            let confidenceBadge = '';
-            if (trafficState.confidence > 85) confidenceBadge = '<span class="efficiency-badge" style="background: rgba(16, 185, 129, 0.2); color: var(--low-traffic);">🟢 HIGH RELIABILITY</span>';
-            else if (trafficState.confidence >= 60) confidenceBadge = '<span class="efficiency-badge" style="background: rgba(245, 158, 11, 0.2); color: var(--medium-traffic);">🟡 MODERATE CONFIDENCE</span>';
-            else confidenceBadge = '<span class="efficiency-badge" style="background: rgba(239, 68, 68, 0.2); color: var(--high-traffic);">🔴 LOW CONFIDENCE</span>';
+        // Confidence Badge Logic
+        let confidenceBadge = '';
+        if (trafficState.confidence > 85) confidenceBadge = '<span class="efficiency-badge" style="background: rgba(16, 185, 129, 0.2); color: var(--low-traffic);">🟢 HIGH RELIABILITY</span>';
+        else if (trafficState.confidence >= 60) confidenceBadge = '<span class="efficiency-badge" style="background: rgba(245, 158, 11, 0.2); color: var(--medium-traffic);">🟡 MODERATE CONFIDENCE</span>';
+        else confidenceBadge = '<span class="efficiency-badge" style="background: rgba(239, 68, 68, 0.2); color: var(--high-traffic);">🔴 LOW CONFIDENCE</span>';
 
-            const lowConfWarning = trafficState.confidence < 60 ? '<div class="ai-insight-text" style="color: var(--high-traffic); border-left-color: var(--high-traffic);">⚠ Low confidence prediction — results may vary.</div>' : '';
-            const stabilityLabel = `<div style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem; letter-spacing: 1px;">SYSTEM STABILITY: <span style="color: ${trafficState.stability === 'HIGH' ? 'var(--low-traffic)' : (trafficState.stability === 'MODERATE' ? 'var(--medium-traffic)' : 'var(--high-traffic)')}">${trafficState.stability}</span></div>`;
-            
-            // Route Comparison Panel
-            const comparisonPanel = `
-                <div class="route-comparison-panel">
-                    <div class="comp-item">
-                        <div class="comp-label">Main Route</div>
-                        <div class="comp-val">${mainRoute.time} min</div>
-                    </div>
-                    <div class="comp-item">
-                        <div class="comp-label">Optimal</div>
-                        <div class="comp-val ${efficiency > 0 ? 'faster' : ''}">${activeRoute.time} min</div>
-                    </div>
+        const lowConfWarning = trafficState.confidence < 60 ? '<div class="ai-insight-text" style="color: var(--high-traffic); border-left-color: var(--high-traffic);">⚠ Low confidence prediction — results may vary.</div>' : '';
+        const stabilityLabel = `<div style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem; letter-spacing: 1px;">SYSTEM STABILITY: <span style="color: ${trafficState.stability === 'HIGH' ? 'var(--low-traffic)' : (trafficState.stability === 'MODERATE' ? 'var(--medium-traffic)' : 'var(--high-traffic)')}">${trafficState.stability}</span></div>`;
+        
+        // Route Comparison Panel
+        const comparisonPanel = `
+            <div class="route-comparison-panel">
+                <div class="comp-item">
+                    <div class="comp-label">Main Route</div>
+                    <div class="comp-val">${mainRoute.time} min</div>
                 </div>
-            `;
-
-            const trustBadges = `
-                <div class="trust-badge">
-                    <i class="fas fa-check-circle"></i> Real-time Simulation Active
-                    <span style="margin: 0 5px;">|</span>
-                    <i class="fas fa-microchip"></i> Powered by Neural Traffic Model
+                <div class="comp-item">
+                    <div class="comp-label">Optimal</div>
+                    <div class="comp-val ${efficiency > 0 ? 'faster' : ''}">${activeRoute.time} min</div>
                 </div>
+            </div>
+        `;
+
+        const trustBadges = `
+            <div class="trust-badge">
+                <i class="fas fa-check-circle"></i> Real-time Simulation Active
+                <span style="margin: 0 5px;">|</span>
+                <i class="fas fa-microchip"></i> Powered by Neural Traffic Model
+            </div>
             `;
             
             // Generate dynamic "Why this route?" explanation
@@ -1070,7 +1508,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     DEMO_MODE: isDemoMode ? "ON" : "OFF"
                 }
             });
-        }, 300);
     };
 
     const updateHeaderStatus = () => {
@@ -1171,6 +1608,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const initMap = () => {
         const defaultCoords = [22.5726, 88.3639]; // Default: Kolkata
         
+        // Cleanup existing routing control if it exists
+        if (routingControl) {
+            map.removeControl(routingControl);
+        }
+        
         map = L.map('map', {
             center: defaultCoords,
             zoom: 13,
@@ -1207,10 +1649,10 @@ document.addEventListener('DOMContentLoaded', () => {
             router: L.Routing.osrmv1({
                 serviceUrl: 'https://router.project-osrm.org/route/v1',
                 requestParameters: {
-                    alternatives: 3 // Request up to 3 alternatives
+                    alternatives: 1 // Request up to 1 alternative (reduced from 3 for performance)
                 }
             }),
-            routeWhileDragging: true,
+            routeWhileDragging: false, // Disabled to prevent continuous recalculation during drag
             showAlternatives: true,
             addWaypoints: false, // Prevent users from adding waypoints manually
             altLineOptions: {
@@ -1225,28 +1667,69 @@ document.addEventListener('DOMContentLoaded', () => {
         routingControl.on('routesfound', (e) => {
             const routes = e.routes;
             
+            // LOG: Routes found event
+            console.log('[ROUTE AUDIT] Routes found event triggered');
+            console.log('[ROUTE AUDIT] Number of routes:', routes ? routes.length : 0);
+            
             if (!routes || routes.length === 0) {
-                // 9. FAILSAFE (Routing Fail)
+                // 9. FAILSAFE (Routing Fail) - DO NOT return 0 km/0 min
+                console.error('[ROUTE ERROR] No routes found in OSRM response');
                 trafficState.level = 'medium';
                 const suggestEl = document.getElementById('altRoute');
                 if (suggestEl) {
-                    suggestEl.innerHTML = '<i class="fas fa-exclamation-circle"></i> Simulated route: Connection to grid lost. <br> <span style="font-size: 0.8rem; opacity: 0.7;">Direct point-to-point synchronization active.</span>';
+                    suggestEl.innerHTML = '<i class="fas fa-exclamation-circle"></i> Route calculation failed. <br> <span style="font-size: 0.8rem; opacity: 0.7;">Unable to find route between these locations. They may not be connected by road network.</span>';
+                }
+                
+                // Show error in route metrics instead of 0 km/0 min
+                const metricsEl = document.getElementById('routeMetrics');
+                if (metricsEl) {
+                    metricsEl.textContent = 'Route unavailable';
+                    metricsEl.style.color = '#ff6b6b';
                 }
                 return;
             }
 
-            // Store all routes in Central State
-            trafficState.routes = routes.map((r, i) => {
+            // Store all routes in Central State with validation
+            trafficState.routes = [];
+            for (let i = 0; i < routes.length; i++) {
+                const r = routes[i];
                 const dist = r.summary.totalDistance / 1000;
                 const time = Math.round(r.summary.totalTime / 60);
                 
-                return {
+                // LOG: Route data
+                console.log(`[ROUTE AUDIT] Route ${i+1}: Distance=${dist.toFixed(2)} km, Duration=${time} min`);
+                
+                // VALIDATE: Distance and duration are reasonable
+                if (dist <= 0 || time <= 0) {
+                    console.error(`[ROUTE ERROR] Route ${i+1} has invalid distance or duration: dist=${dist}, time=${time}`);
+                    continue; // Skip invalid routes
+                }
+                
+                trafficState.routes.push({
                     route: r,
                     distance: dist,
                     time: time,
-                    name: getRouteName(r) || (i === 0 ? 'Main Route' : 'Alternative Route')
-                };
-            });
+                    name: getRouteName(r, i) || (i === 0 ? 'Main Route' : 'Alternative Route')
+                });
+            }
+            
+            // VALIDATE: At least one valid route
+            if (trafficState.routes.length === 0) {
+                console.error('[ROUTE ERROR] All routes had invalid distance/duration');
+                const suggestEl = document.getElementById('altRoute');
+                if (suggestEl) {
+                    suggestEl.innerHTML = '<i class="fas fa-exclamation-circle"></i> Route calculation failed. <br> <span style="font-size: 0.8rem; opacity: 0.7;">Invalid route data received from routing service.</span>';
+                }
+                
+                const metricsEl = document.getElementById('routeMetrics');
+                if (metricsEl) {
+                    metricsEl.textContent = 'Route unavailable';
+                    metricsEl.style.color = '#ff6b6b';
+                }
+                return;
+            }
+            
+            console.log(`[ROUTE AUDIT] Successfully processed ${trafficState.routes.length} valid routes`);
 
             // Compatibility with legacy window.availableRoutes
             window.availableRoutes = trafficState.routes;
@@ -1256,6 +1739,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 distance: main.distance,
                 time: main.time
             };
+            
+            // ✅ If user has already clicked INITIATE ANALYSIS, update Route Metrics NOW!
+            if (userHasSubmittedPrediction) {
+                const bestIdx = trafficState.routes.reduce((best, r, i, arr) => r.time < arr[best].time ? i : best, 0);
+                const highlightIdx = (trafficState.level === 'high' && trafficState.routes.length > 1) ? 1 : 0;
+                const selected = trafficState.routes[isEmergencyMode ? bestIdx : highlightIdx];
+                
+                updateRouteMetricsUI(selected.distance, selected.time);
+                updateAISuggestionUI();
+                window.highlightRoute(isEmergencyMode ? bestIdx : highlightIdx);
+            }
 
             // Smart Camera System
             map.fitBounds(main.route.coordinates, {
@@ -1280,6 +1774,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 updateRouteMetricsUI(selectedData.distance, selectedData.time);
                 updateAISuggestionUI();
                 startLiveSimulation(); // START LIVE SIMULATION ENGINE
+                
+                // Stop simulation after 30 seconds to prevent continuous background activity
+                setTimeout(() => {
+                    if (simulationInterval) {
+                        clearInterval(simulationInterval);
+                        console.log('[PERFORMANCE] Stopped simulation interval after 30 seconds');
+                    }
+                }, 30000);
             }
 
             // ✅ NEW: Trigger validation update as soon as routes are found
@@ -1315,13 +1817,73 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
-        startMarker.on('dragend', () => updateRouteFromMarkers());
-        endMarker.on('dragend', () => updateRouteFromMarkers());
+        // REMOVED: Automatic route generation on marker drag - Analysis lock prevents automatic route generation
+        // startMarker.on('dragend', () => updateRouteFromMarkers());
+        // endMarker.on('dragend', () => updateRouteFromMarkers());
     };
 
+    let isRouteCalculationInProgress = false; // Prevent duplicate route calculations
+    
     const updateRouteFromMarkers = async (skipReverse = false) => {
+        // STRICT ANALYSIS LOCK - Only proceed if analysis was triggered by Initial Analysis button
+        if (!analysisTriggered) {
+            console.log('[ANALYSIS LOCK] Route generation blocked - analysis not triggered by Initial Analysis button');
+            return;
+        }
+        
+        // PREVENT DUPLICATE ROUTE CALCULATIONS
+        if (isRouteCalculationInProgress) {
+            console.log('[ROUTE AUDIT] Route calculation already in progress, skipping duplicate call');
+            return;
+        }
+        
+        const startTime = performance.now();
+        isRouteCalculationInProgress = true;
+        
         const startPos = startMarker.getLatLng();
         const endPos = endMarker.getLatLng();
+        
+        // LOG: Start and destination coordinates
+        console.log('[ROUTE AUDIT] Update route from markers');
+        console.log('[ROUTE AUDIT] Start Location:', locationInput.value);
+        console.log('[ROUTE AUDIT] Destination:', destinationInput.value);
+        console.log('[ROUTE AUDIT] Start Lat:', startPos.lat, 'Start Lon:', startPos.lng);
+        console.log('[ROUTE AUDIT] End Lat:', endPos.lat, 'End Lon:', endPos.lng);
+        
+        // VALIDATE: Coordinates are different
+        if (startPos.lat === endPos.lat && startPos.lng === endPos.lng) {
+            console.error('[ROUTE ERROR] Start and destination coordinates are identical');
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = 'Same location';
+                metricsEl.style.color = '#ff6b6b';
+            }
+            isRouteCalculationInProgress = false;
+            return;
+        }
+        
+        // VALIDATE: Coordinates are within valid ranges
+        if (!(-90 <= startPos.lat <= 90) || !(-180 <= startPos.lng <= 180)) {
+            console.error('[ROUTE ERROR] Invalid start coordinates:', startPos.lat, startPos.lng);
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = 'Invalid start location';
+                metricsEl.style.color = '#ff6b6b';
+            }
+            isRouteCalculationInProgress = false;
+            return;
+        }
+        
+        if (!(-90 <= endPos.lat <= 90) || !(-180 <= endPos.lng <= 180)) {
+            console.error('[ROUTE ERROR] Invalid end coordinates:', endPos.lat, endPos.lng);
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = 'Invalid destination';
+                metricsEl.style.color = '#ff6b6b';
+            }
+            isRouteCalculationInProgress = false;
+            return;
+        }
         
         routingControl.setWaypoints([
             L.latLng(startPos.lat, startPos.lng),
@@ -1329,34 +1891,213 @@ document.addEventListener('DOMContentLoaded', () => {
         ]);
         routingControl.route(); // FORCE route refresh
         
-        if (skipReverse) return;
+        if (skipReverse) {
+            isRouteCalculationInProgress = false;
+            console.log(`[ROUTE TIMING] Route calculation (skip reverse): ${(performance.now() - startTime).toFixed(2)}ms`);
+            return;
+        }
         
         try {
-            const resStart = await fetch(`/api/reverse_geocode?lat=${startPos.lat}&lon=${startPos.lng}`);
+            // Create or use existing AbortController
+            if (searchAbortController) {
+                searchAbortController.abort();
+            }
+            searchAbortController = new AbortController();
+            const signal = searchAbortController.signal;
+            
+            const resStart = await fetch(`/api/reverse_geocode?lat=${startPos.lat}&lon=${startPos.lng}`, { signal });
             const dataStart = await resStart.json();
             locationInput.value = dataStart.display_name.split(',')[0];
 
-            const resEnd = await fetch(`/api/reverse_geocode?lat=${endPos.lat}&lon=${endPos.lng}`);
+            const resEnd = await fetch(`/api/reverse_geocode?lat=${endPos.lat}&lon=${endPos.lng}`, { signal });
             const dataEnd = await resEnd.json();
             destinationInput.value = dataEnd.display_name.split(',')[0];
-        } catch (e) {}
+            
+            // LOG: Verified location names match coordinates
+            console.log('[ROUTE AUDIT] Verified start location:', dataStart.display_name);
+            console.log('[ROUTE AUDIT] Verified destination:', dataEnd.display_name);
+            console.log(`[ROUTE TIMING] Route calculation with reverse geocode: ${(performance.now() - startTime).toFixed(2)}ms`);
+        } catch (e) {
+            if (e.name !== 'AbortError') {
+                console.error('updateRouteFromMarkers error:', e);
+            }
+        } finally {
+            isRouteCalculationInProgress = false;
+        }
     };
 
     const syncMapWithSearch = async (startQuery, endQuery) => {
+        // STRICT ANALYSIS LOCK - Only proceed if analysis was triggered by Initial Analysis button
+        if (!analysisTriggered) {
+            console.log('[ANALYSIS LOCK] Map sync blocked - analysis not triggered by Initial Analysis button');
+            return false;
+        }
+        
+        const startTime = performance.now();
         try {
-            const resStart = await fetch(`/api/geocode?q=${encodeURIComponent(startQuery)}&limit=1`);
-            const dataStart = await resStart.json();
-            const resEnd = await fetch(`/api/geocode?q=${encodeURIComponent(endQuery)}&limit=1`);
-            const dataEnd = await resEnd.json();
+            let s, e;
+            
+            // LOG: Search queries
+            console.log('[ROUTE AUDIT] Sync map with search');
+            console.log('[ROUTE AUDIT] Start query:', startQuery);
+            console.log('[ROUTE AUDIT] End query:', endQuery);
+            
+            // Abort any existing search first
+            if (searchAbortController) {
+                searchAbortController.abort();
+            }
+            searchAbortController = new AbortController();
+            const signal = searchAbortController.signal;
+            
+            // Check if we already have coordinates on the inputs
+            const existingStartCoords = locationInput.getAttribute('data-coords');
+            const existingEndCoords = destinationInput.getAttribute('data-coords');
+            
+            // Prepare geocode promises for missing coordinates: start and end in parallel
+            const promises = [];
+            
+            if (existingStartCoords) {
+                const [lat, lon] = existingStartCoords.split(',').map(parseFloat);
+                s = [lat, lon];
+                const startPlaceId = locationInput.getAttribute('data-place-id') || 'N/A';
+                const startSource = locationInput.getAttribute('data-source') || 'N/A';
+                const startPlaceName = locationInput.getAttribute('data-place-name') || locationInput.value;
+                console.log('[AUTOCOMPLETE SELECT] Selected Place (Start):');
+                console.log('[AUTOCOMPLETE SELECT] Display Name:', locationInput.value);
+                console.log('[AUTOCOMPLETE SELECT] Latitude:', lat);
+                console.log('[AUTOCOMPLETE SELECT] Longitude:', lon);
+                console.log('[AUTOCOMPLETE SELECT] Place ID:', startPlaceId);
+                console.log('[AUTOCOMPLETE SELECT] Source:', startSource);
+                console.log('[AUTOCOMPLETE SELECT] Place Name:', startPlaceName);
+                console.log('[ROUTE AUDIT] Using existing start coords:', lat, lon);
+            } else {
+            // Need to geocode start even if no autocomplete selected
+            console.log('[DEBUG] Geocoding start with query:', startQuery);
+            promises.push(
+                fetch(`/api/geocode?q=${encodeURIComponent(startQuery)}`, { signal })
+                    .then(r => r.json())
+                    .then(data => {
+                        console.log('[DEBUG] Start geocoding response:', data);
+                        if (data.results && data.results.length > 0) {
+                            const result = data.results[0];
+                            // DEBUG: Log before updating input
+                            console.log('[DEBUG] Before updating locationInput.value:', locationInput.value);
+                            console.log('[DEBUG] Geocoded start result:', result.display_name);
+                            // REMOVED: locationInput.value = result.display_name; - Do not update input during geocoding
+                            locationInput.setAttribute('data-coords', `${result.lat},${result.lon}`);
+                            console.log('[DEBUG] After updating locationInput.value:', locationInput.value);
+                            console.log(`[ROUTE AUDIT] Geocoded start:`, result.display_name, 'coords:', result.lat, result.lon);
+                            return { coords: [result.lat, result.lon], display_name: result.display_name };
+                        }
+                        console.error('[ROUTE ERROR] Geocoding failed for start:', startQuery);
+                        return null;
+                    })
+                );
+            }
+            
+            if (existingEndCoords) {
+                const [lat, lon] = existingEndCoords.split(',').map(parseFloat);
+                e = [lat, lon];
+                const endPlaceId = destinationInput.getAttribute('data-place-id') || 'N/A';
+                const endSource = destinationInput.getAttribute('data-source') || 'N/A';
+                const endPlaceName = destinationInput.getAttribute('data-place-name') || destinationInput.value;
+                console.log('[AUTOCOMPLETE SELECT] Selected Place (Destination):');
+                console.log('[AUTOCOMPLETE SELECT] Display Name:', destinationInput.value);
+                console.log('[AUTOCOMPLETE SELECT] Latitude:', lat);
+                console.log('[AUTOCOMPLETE SELECT] Longitude:', lon);
+                console.log('[AUTOCOMPLETE SELECT] Place ID:', endPlaceId);
+                console.log('[AUTOCOMPLETE SELECT] Source:', endSource);
+                console.log('[AUTOCOMPLETE SELECT] Place Name:', endPlaceName);
+                console.log('[ROUTE AUDIT] Using existing end coords:', lat, lon);
+            } else {
+                // Need to geocode end even if no autocomplete selected
+                console.log('[DEBUG] Geocoding end with query:', endQuery);
+                promises.push(
+                    fetch(`/api/geocode?q=${encodeURIComponent(endQuery)}`, { signal })
+                        .then(r => r.json())
+                        .then(data => {
+                            console.log('[DEBUG] End geocoding response:', data);
+                            if (data.results && data.results.length > 0) {
+                                const result = data.results[0];
+                                // DEBUG: Log before updating input
+                                console.log('[DEBUG] Before updating destinationInput.value:', destinationInput.value);
+                                console.log('[DEBUG] Geocoded end result:', result.display_name);
+                                // REMOVED: destinationInput.value = result.display_name; - Do not update input during geocoding
+                                destinationInput.setAttribute('data-coords', `${result.lat},${result.lon}`);
+                                console.log('[DEBUG] After updating destinationInput.value:', destinationInput.value);
+                                console.log('[ROUTE AUDIT] Geocoded end:', result.display_name, 'coords:', result.lat, result.lon);
+                                return { coords: [result.lat, result.lon], display_name: result.display_name };
+                            }
+                            console.error('[ROUTE ERROR] Geocoding failed for end:', endQuery);
+                            return null;
+                        })
+                );
+            }
+            
+            // Wait for all geocode promises!
+            const geocodeResults = await Promise.all(promises);
+            
+            // DEBUG: Log geocode results
+            console.log('[DEBUG] Geocode results:', geocodeResults);
+            console.log('[DEBUG] locationInput.value after geocoding:', locationInput.value);
+            console.log('[DEBUG] destinationInput.value after geocoding:', destinationInput.value);
+            
+            let geocodeIdx = 0;
+            if (!s && geocodeResults.length > geocodeIdx && geocodeResults[geocodeIdx]) {
+                const startResult = geocodeResults[geocodeIdx++];
+                s = startResult.coords;
+                // Update input value AFTER geocoding is complete
+                if (startResult.display_name) {
+                    locationInput.value = startResult.display_name;
+                }
+            }
+            if (!e && geocodeResults.length > geocodeIdx && geocodeResults[geocodeIdx]) {
+                const endResult = geocodeResults[geocodeIdx];
+                e = endResult.coords;
+                // Update input value AFTER geocoding is complete
+                if (endResult.display_name) {
+                    destinationInput.value = endResult.display_name;
+                }
+            }
 
-            if (dataStart.results && dataStart.results.length > 0 && dataEnd.results && dataEnd.results.length > 0) {
-                const s = [dataStart.results[0].lat, dataStart.results[0].lon];
-                const e = [dataEnd.results[0].lat, dataEnd.results[0].lon];
+            if (s && e) {
+                // DEBUG: Log coordinates before validation
+                console.log('[DEBUG] Start coordinates (s):', s);
+                console.log('[DEBUG] End coordinates (e):', e);
+                console.log('[DEBUG] Start equals End?', s[0] === e[0] && s[1] === e[1]);
                 
-                // Update attributes for predict API
-                locationInput.setAttribute('data-coords', `${s[0]},${s[1]}`);
-                destinationInput.setAttribute('data-coords', `${e[0]},${e[1]}`);
-
+                // VALIDATE: Coordinates are different
+                if (s[0] === e[0] && s[1] === e[1]) {
+                    console.error('[ROUTE ERROR] Start and destination coordinates are identical after geocoding');
+                    const suggestEl = document.getElementById('altRoute');
+                    if (suggestEl) {
+                        suggestEl.innerHTML = '<i class="fas fa-exclamation-circle"></i> Start and destination are the same location.';
+                    }
+                    console.log(`[ROUTE TIMING] Sync map with search (validation failed): ${(performance.now() - startTime).toFixed(2)}ms`);
+                    return false;
+                }
+                
+                // VALIDATE: Coordinates are within valid ranges
+                if (!(-90 <= s[0] <= 90) || !(-180 <= s[1] <= 180)) {
+                    console.error('[ROUTE ERROR] Invalid start coordinates after geocoding:', s);
+                    const suggestEl = document.getElementById('altRoute');
+                    if (suggestEl) {
+                        suggestEl.innerHTML = '<i class="fas fa-exclamation-circle"></i> Invalid start location coordinates.';
+                    }
+                    console.log(`[ROUTE TIMING] Sync map with search (validation failed): ${(performance.now() - startTime).toFixed(2)}ms`);
+                    return false;
+                }
+                
+                if (!(-90 <= e[0] <= 90) || !(-180 <= e[1] <= 180)) {
+                    console.error('[ROUTE ERROR] Invalid end coordinates after geocoding:', e);
+                    const suggestEl = document.getElementById('altRoute');
+                    if (suggestEl) {
+                        suggestEl.innerHTML = '<i class="fas fa-exclamation-circle"></i> Invalid destination coordinates.';
+                    }
+                    console.log(`[ROUTE TIMING] Sync map with search (validation failed): ${(performance.now() - startTime).toFixed(2)}ms`);
+                    return false;
+                }
+                
                 // Smoothly move markers and update routing
                 startMarker.setLatLng(s);
                 endMarker.setLatLng(e);
@@ -1367,20 +2108,32 @@ document.addEventListener('DOMContentLoaded', () => {
                 ]);
                 routingControl.route(); // FORCE route refresh
                 
+                console.log('[ROUTE AUDIT] Route calculation triggered with valid coordinates');
+                console.log(`[ROUTE TIMING] Sync map with search (success): ${(performance.now() - startTime).toFixed(2)}ms`);
                 return true;
             } else {
+                // Show location not found message
+                const suggestEl = document.getElementById('altRoute');
+                if (suggestEl) {
+                    suggestEl.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Location could not be resolved. Please refine your search.';
+                }
                 // Determine which one failed
-                if (!dataStart.results || dataStart.results.length === 0) {
+                if (!s) {
                     console.warn(`Geocoding failed for start: ${startQuery}`);
                 }
-                if (!dataEnd.results || dataEnd.results.length === 0) {
+                if (!e) {
                     console.warn(`Geocoding failed for destination: ${endQuery}`);
                 }
+                console.log(`[ROUTE TIMING] Sync map with search (geocoding failed): ${(performance.now() - startTime).toFixed(2)}ms`);
+                return false;
             }
         } catch (e) {
-            console.error('syncMapWithSearch error:', e);
+            if (e.name !== 'AbortError') {
+                console.error('syncMapWithSearch error:', e);
+            }
+            console.log(`[ROUTE TIMING] Sync map with search (error): ${(performance.now() - startTime).toFixed(2)}ms`);
+            return false;
         }
-        return false;
     };
 
     // Personalization & Insights
@@ -1534,11 +2287,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const generateDynamicZones = (loc) => {
         const tags = ['Sector 7', 'Terminal A', 'Hub South', 'Grid 404', 'Alpha Node', 'Bypass'];
-        currentZones = [{ name: loc.split(',')[0], intensity: Math.floor(Math.random() * 60 + 20) }];
+        const intensities = [45, 65, 30, 75, 50, 40];
+        currentZones = [{ name: loc.split(',')[0], intensity: 55 }];
         for(let i=0; i<5; i++) {
             currentZones.push({ 
                 name: tags[i], 
-                intensity: Math.floor(Math.random() * 80 + 10) 
+                intensity: intensities[i] 
             });
         }
         renderZones();
@@ -1567,37 +2321,60 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     };
 
-    // Form Submission
+    // Form Submission - Initial Analysis Button
     predictionForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         
-        userHasSubmittedPrediction = true; // User initiated prediction
-        hasSpokenForCurrentPrediction = false; // Reset voice flag for new prediction
-        apiStartTime = performance.now(); // Start timing
-        trafficState.routes = []; // Reset routes for new search
+        // STRICT ANALYSIS LOCK - Only this button may set analysisTriggered to true
+        analysisTriggered = true;
+        console.log('[ANALYSIS LOCK] Initial Analysis button pressed - analysis triggered');
         
-        const loc = locationInput.value;
-        const dest = destinationInput.value;
+        // ✅ 1. Reset ALL OLD DATA first!
+        userHasSubmittedPrediction = true;
+        hasSpokenForCurrentPrediction = false;
+        apiStartTime = performance.now();
+        trafficState.routes = [];
+        window.lastRouteStats = null;
+        window.availableRoutes = [];
+        
+        locationInput.removeAttribute('data-coords');
+        destinationInput.removeAttribute('data-coords');
+        
+        const metricsEl = document.getElementById('routeMetrics');
+        const confidenceScoreEl = document.getElementById('confidenceScore');
+        const confidenceFillEl = document.getElementById('confidenceFill');
+        const trafficLevelEl = document.getElementById('trafficLevel');
+        
+        if (metricsEl) metricsEl.textContent = 'Calculating route...';
+        if (confidenceScoreEl) confidenceScoreEl.textContent = '0';
+        if (confidenceFillEl) confidenceFillEl.style.width = '0';
+        if (trafficLevelEl) trafficLevelEl.textContent = '';
+        
+        const loc = locationInput.value.trim();
+        const dest = destinationInput.value.trim();
         const day = document.getElementById('day').value;
         const time = document.getElementById('time').value;
-
-        // Display calculating state in metrics if elements exist
-        const metricsEl = document.getElementById('routeMetrics');
-        if (metricsEl) metricsEl.textContent = 'Calculating route...';
+        
+        // DEBUG: Log origin and destination before geocoding
+        console.log('[DEBUG] Origin before geocoding:', loc);
+        console.log('[DEBUG] Destination before geocoding:', dest);
+        console.log('[DEBUG] locationInput.value:', locationInput.value);
+        console.log('[DEBUG] destinationInput.value:', destinationInput.value);
+        
+        if (!loc || !dest) {
+            alert('Please enter both start and destination locations');
+            return;
+        }
 
         const mapSynced = await syncMapWithSearch(loc, dest);
         
         if (!mapSynced) {
-            // Show a temporary warning but try to proceed with names only if necessary
-            console.warn("Map sync failed. Proceeding with text-based analysis.");
-            const suggestEl = document.getElementById('altRoute');
-            if (suggestEl) {
-                suggestEl.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Precise coordinates not found. <br> <span style="font-size: 0.8rem; opacity: 0.7;">Using general area analysis for JIS University/Agarpara.</span>';
-            }
+            loaderWrapper.classList.add('hidden');
+            initialState.classList.remove('hidden');
+            return;
         }
-
+        
         generateDynamicZones(loc);
-
         initialState.classList.add('hidden');
         predictionContent.classList.add('hidden');
         loaderWrapper.classList.remove('hidden');
@@ -1608,6 +2385,134 @@ document.addEventListener('DOMContentLoaded', () => {
         const startCoords = locationInput.getAttribute('data-coords');
         const endCoords = destinationInput.getAttribute('data-coords');
         
+        // LOG: Start and destination location text
+        console.log(`[ROUTE AUDIT] Start Location: ${loc}`);
+        console.log(`[ROUTE AUDIT] Destination: ${dest}`);
+        
+        // VALIDATE: Coordinates are present
+        if (!startCoords || !endCoords) {
+            console.error('[ROUTE ERROR] Missing coordinates for route calculation');
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = 'Location could not be resolved.';
+                metricsEl.style.color = '#ff6b6b';
+            }
+            loaderWrapper.classList.add('hidden');
+            initialState.classList.remove('hidden');
+            return;
+        }
+        
+        const [startLat, startLon] = startCoords.split(',').map(parseFloat);
+        const [endLat, endLon] = endCoords.split(',').map(parseFloat);
+        
+        // LOG: Start and destination coordinates
+        console.log(`[ROUTE AUDIT] Start Lat: ${startLat}, Start Lon: ${startLon}`);
+        console.log(`[ROUTE AUDIT] End Lat: ${endLat}, End Lon: ${endLon}`);
+        
+        // VALIDATE: Coordinates are different
+        if (startLat === endLat && startLon === endLon) {
+            console.error('[ROUTE ERROR] Start and destination coordinates are identical');
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = 'Start and destination are the same location.';
+                metricsEl.style.color = '#ff6b6b';
+            }
+            loaderWrapper.classList.add('hidden');
+            initialState.classList.remove('hidden');
+            return;
+        }
+        
+        // VALIDATE: Coordinates are within valid ranges
+        if (!(-90 <= startLat <= 90) || !(-180 <= startLon <= 180)) {
+            console.error('[ROUTE ERROR] Invalid start coordinates:', startLat, startLon);
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = 'Invalid start location.';
+                metricsEl.style.color = '#ff6b6b';
+            }
+            loaderWrapper.classList.add('hidden');
+            initialState.classList.remove('hidden');
+            return;
+        }
+        
+        if (!(-90 <= endLat <= 90) || !(-180 <= endLon <= 180)) {
+            console.error('[ROUTE ERROR] Invalid destination coordinates:', endLat, endLon);
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = 'Invalid destination location.';
+                metricsEl.style.color = '#ff6b6b';
+            }
+            loaderWrapper.classList.add('hidden');
+            initialState.classList.remove('hidden');
+            return;
+        }
+        
+        // Call backend route API for proper logging and validation
+        const routeRequestData = {
+            start_lat: startLat,
+            start_lon: startLon,
+            end_lat: endLat,
+            end_lon: endLon,
+            start_location: loc,
+            end_location: dest,
+            alternatives: true
+        };
+        
+        console.log(`[ROUTE AUDIT] Calling /api/route with data:`, routeRequestData);
+        
+        let routeData = null;
+        let routeError = null;
+        
+        try {
+            const routeRes = await fetch('/api/route', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(routeRequestData)
+            });
+            
+            console.log(`[ROUTE AUDIT] /api/route response status: ${routeRes.status}`);
+            
+            if (routeRes.ok) {
+                routeData = await routeRes.json();
+                console.log(`[ROUTE AUDIT] /api/route response data:`, routeData);
+                
+                if (routeData.routes && routeData.routes.length > 0) {
+                    const mainRoute = routeData.routes[0];
+                    console.log(`[ROUTE AUDIT] Main route distance: ${mainRoute.distance.toFixed(2)} km, duration: ${mainRoute.duration.toFixed(2)} min`);
+                    
+                    // Update route metrics with actual OSRM data
+                    const metricsEl = document.getElementById('routeMetrics');
+                    if (metricsEl) {
+                        metricsEl.textContent = `${mainRoute.distance.toFixed(1)} km | ${Math.round(mainRoute.duration)} min`;
+                        metricsEl.style.color = '#10b981';
+                    }
+                } else {
+                    routeError = 'No routes found in response';
+                    console.error('[ROUTE ERROR]', routeError);
+                }
+            } else {
+                const errorData = await routeRes.json();
+                routeError = errorData.error || 'Route calculation failed';
+                console.error('[ROUTE ERROR]', routeError);
+            }
+        } catch (routeErr) {
+            routeError = routeErr.message || 'Route calculation failed';
+            console.error('[ROUTE ERROR] Exception:', routeError);
+        }
+        
+        // If route calculation failed, show error and don't continue
+        if (routeError) {
+            const metricsEl = document.getElementById('routeMetrics');
+            if (metricsEl) {
+                metricsEl.textContent = routeError;
+                metricsEl.style.color = '#ff6b6b';
+            }
+            loaderWrapper.classList.add('hidden');
+            initialState.classList.remove('hidden');
+            return;
+        }
+        
+        // Continue with traffic prediction
         const requestData = {
             location: loc,
             destination: dest,
@@ -1647,8 +2552,27 @@ document.addEventListener('DOMContentLoaded', () => {
                     document.getElementById('trafficLevel').textContent = trafficState.level.toUpperCase();
                     document.getElementById('trafficLevel').className = `traffic-status ${data.prediction}`; // Keep original casing for CSS class
                     document.getElementById('confidenceScore').textContent = data.confidence;
-                    document.getElementById('confidenceFill').style.width = data.confidence;
+                    document.getElementById('confidenceFill').style.width = data.confidence + '%';
                     document.getElementById('bestTime').textContent = data.best_time;
+                    
+                    // Show notifications based on data
+                    if (trafficState.level === 'high') {
+                        showNotification('congestion', 'High Traffic Detected', 'Heavy congestion expected. Consider alternative routes.', 'traffic-light');
+                    } else if (trafficState.level === 'medium') {
+                        showNotification('congestion', 'Moderate Traffic', 'Some congestion expected. Plan your trip accordingly.', 'traffic-light');
+                    }
+                    
+                    if (data.weather) {
+                        let weatherIcon = 'cloud-sun';
+                        if (data.weather.rain_condition) weatherIcon = 'cloud-rain';
+                        if (data.weather.fog_detected) weatherIcon = 'smog';
+                        if (data.weather.storm_detected) weatherIcon = 'cloud-bolt';
+                        showNotification('weather', `Weather Update: ${data.weather.condition}`, `Visibility: ${data.weather.visibility} km, Temp: ${data.weather.temperature}°C`, weatherIcon);
+                    }
+                    
+                    if (data.accident_risk && data.accident_risk.level === 'high') {
+                        showNotification('accident', 'High Accident Risk', 'High risk of accidents detected. Drive carefully.', 'exclamation-triangle');
+                    }
                     
                     // ✅ Display weather and risk data if available
                     if (data.weather || data.accident_risk) {
@@ -1664,25 +2588,30 @@ document.addEventListener('DOMContentLoaded', () => {
                     // ✅ Update Route Validation with real data
                     updateRouteValidation(data);
                     
-                    // Display distance and time in the results
-                    let distance = 0;
-                    let timeEst = 0;
+                    // Route Metrics and UI are handled in 'routesfound' listener!
                     
+                    // ✅ If routes are already available, update UI now!
                     if (trafficState.routes && trafficState.routes.length > 0) {
-                        const selected = trafficState.routes[0];
-                        distance = selected.distance;
-                        timeEst = selected.time;
-                        window.lastRouteStats = { distance, time: timeEst };
-                        updateRouteMetricsUI(distance, timeEst);
-                    }
-                    
-                    if (trafficState.routes) {
-                        updateAISuggestionUI();
-                        
                         const bestIdx = trafficState.routes.reduce((best, r, i, arr) => r.time < arr[best].time ? i : best, 0);
                         const highlightIdx = (trafficState.level === 'high' && trafficState.routes.length > 1) ? 1 : 0;
+                        const selected = trafficState.routes[isEmergencyMode ? bestIdx : highlightIdx];
                         
+                        updateRouteMetricsUI(selected.distance, selected.time);
+                        updateAISuggestionUI();
                         window.highlightRoute(isEmergencyMode ? bestIdx : highlightIdx);
+                    } else {
+                        // If routes aren't here yet, wait a little longer and try again!
+                        setTimeout(() => {
+                            if (trafficState.routes && trafficState.routes.length > 0) {
+                                const bestIdx = trafficState.routes.reduce((best, r, i, arr) => r.time < arr[best].time ? i : best, 0);
+                                const highlightIdx = (trafficState.level === 'high' && trafficState.routes.length > 1) ? 1 : 0;
+                                const selected = trafficState.routes[isEmergencyMode ? bestIdx : highlightIdx];
+                                
+                                updateRouteMetricsUI(selected.distance, selected.time);
+                                updateAISuggestionUI();
+                                window.highlightRoute(isEmergencyMode ? bestIdx : highlightIdx);
+                            }
+                        }, 500);
                     }
                     
                     updateChartVisuals();
@@ -1694,13 +2623,13 @@ document.addEventListener('DOMContentLoaded', () => {
                         day, 
                         time, 
                         result: data.prediction, 
-                        distance: distance.toFixed(1),
-                        time_est: timeEst,
+                        distance: window.lastRouteStats?.distance?.toFixed(1) || 0,
+                        time_est: window.lastRouteStats?.time || 0,
                         timestamp: Date.now() 
                     });
                     localStorage.setItem('trafficHistory', JSON.stringify(trafficHistory));
                     updatePersonalizationUI();
-                }, 1500);
+                }, 1000);
             }
         } catch (err) {
             loaderWrapper.classList.add('hidden');
@@ -1731,8 +2660,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const lvl = trafficState.level.charAt(0).toUpperCase() + trafficState.level.slice(1);
         const m = { High: 1.6, Medium: 1, Low: 0.4 }[lvl];
         
-        // Use real route stats if available, else random
-        const dist = window.lastRouteStats ? parseFloat(window.lastRouteStats.distance) : (Math.random() * 15 + 5);
+        // Use real route stats if available, else fixed values
+        const dist = window.lastRouteStats ? parseFloat(window.lastRouteStats.distance) : 10;
         
         let stats;
         if (lastPredictionData && lastPredictionData.analytics) {
@@ -1743,9 +2672,9 @@ document.addEventListener('DOMContentLoaded', () => {
             };
         } else {
             stats = { 
-                'stat-vehicles': Math.floor((Math.random()*3000+8000)*m), 
-                'stat-speed': Math.floor((Math.random()*25+30)/m), 
-                'stat-delay': Math.floor((Math.random()*15+2)*m) 
+                'stat-vehicles': Math.floor((8000 + 1500)*m), 
+                'stat-speed': Math.floor((30 + 10)/m), 
+                'stat-delay': Math.floor((2 + 8)*m) 
             };
         }
         
@@ -1773,29 +2702,22 @@ document.addEventListener('DOMContentLoaded', () => {
         simulationInterval = setInterval(() => {
             if (!trafficState.routes || trafficState.routes.length === 0) return;
 
-            // 1. LIVE TRAFFIC FLUCTUATION (±5% random variation)
-            // Skip fluctuations in Demo Mode for predictable presentation
+            // 1. LIVE TRAFFIC (no random variation)
             if (!isDemoMode) {
-                console.log("Live Simulation: Fluctuating traffic patterns...");
+                console.log("Live Simulation: Updating traffic patterns...");
                 
-                let totalVariation = 0;
-                trafficState.routes.forEach(route => {
-                    const variation = 0.95 + Math.random() * 0.1;
-                    route.time = Math.round(route.time * variation);
-                    totalVariation += Math.abs(variation - 1);
-
-                    // Add pulse animation to route on map
-                    const paths = document.querySelectorAll('path.leaflet-interactive');
-                    const routePaths = Array.from(paths).filter(p => p.classList.contains('route-main') || p.classList.contains('route-alt'));
-                    routePaths.forEach(p => {
-                        p.classList.remove('route-pulse');
-                        void p.offsetWidth;
-                        p.classList.add('route-pulse');
-                    });
+                let totalVariation = 0.02; // Fixed small variation
+                // Add pulse animation to route on map
+                const paths = document.querySelectorAll('path.leaflet-interactive');
+                const routePaths = Array.from(paths).filter(p => p.classList.contains('route-main') || p.classList.contains('route-alt'));
+                routePaths.forEach(p => {
+                    p.classList.remove('route-pulse');
+                    void p.offsetWidth;
+                    p.classList.add('route-pulse');
                 });
 
                 // 3. LIVE STATUS INDICATOR
-                updateLiveStatusIndicator(totalVariation / trafficState.routes.length);
+                updateLiveStatusIndicator(totalVariation);
             }
 
             // 2. AUTO AI RE-EVALUATION
@@ -1865,8 +2787,95 @@ document.addEventListener('DOMContentLoaded', () => {
     initMap();
     initChart();
     updatePersonalizationUI();
-    setInterval(() => {
-        currentZones.forEach(z => z.intensity = Math.min(100, Math.max(0, z.intensity + Math.floor(Math.random()*5)-2)));
-        renderZones();
-    }, 4000);
+    
+    // Phase 8: Smart Temporal Marker - Auto-detect current date/time
+    const daySelect = document.getElementById('day');
+    const timeInput = document.getElementById('time');
+    
+    // Check localStorage for saved values
+    const savedDay = localStorage.getItem('trafficSense_day');
+    const savedTime = localStorage.getItem('trafficSense_time');
+    
+    if (savedDay && savedTime) {
+        // Restore saved values
+        daySelect.value = savedDay;
+        timeInput.value = savedTime;
+    } else {
+        // Auto-detect current date/time on first load
+        const now = new Date();
+        const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        const currentDay = days[now.getDay()];
+        
+        // Round to nearest hour
+        const currentHour = now.getHours();
+        const roundedHour = currentHour < 10 ? `0${currentHour}:00` : `${currentHour}:00`;
+        
+        daySelect.value = currentDay;
+        timeInput.value = roundedHour;
+        
+        // Save to localStorage
+        localStorage.setItem('trafficSense_day', currentDay);
+        localStorage.setItem('trafficSense_time', roundedHour);
+    }
+    
+    // Add event listeners to save manual changes
+    daySelect.addEventListener('change', () => {
+        localStorage.setItem('trafficSense_day', daySelect.value);
+        // RESET ANALYSIS LOCK on day change
+        analysisTriggered = false;
+        markResultsAsOutdated();
+        updateTemporalStatus();
+    });
+    
+    timeInput.addEventListener('change', () => {
+        localStorage.setItem('trafficSense_time', timeInput.value);
+        // RESET ANALYSIS LOCK on time change
+        analysisTriggered = false;
+        markResultsAsOutdated();
+        updateTemporalStatus();
+    });
+    
+    // Function to update LIVE/HISTORICAL status indicator
+    const updateTemporalStatus = () => {
+        const now = new Date();
+        const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        const currentDay = days[now.getDay()];
+        const currentHour = now.getHours();
+        
+        const selectedDay = daySelect.value;
+        const selectedHour = parseInt(timeInput.value.split(':')[0]);
+        
+        // Check if selected day and time represent current real-world conditions
+        const isCurrentDay = selectedDay === currentDay;
+        const isCurrentHour = selectedHour === currentHour;
+        
+        const statusEl = document.getElementById('temporalStatus');
+        if (!statusEl) {
+            // Create status element if it doesn't exist
+            const formGroup = daySelect.closest('.form-group').parentElement;
+            const statusDiv = document.createElement('div');
+            statusDiv.id = 'temporalStatus';
+            statusDiv.style.cssText = 'text-align: center; margin-top: 0.5rem; font-size: 0.85rem; font-weight: 600; padding: 0.5rem; border-radius: 8px;';
+            formGroup.appendChild(statusDiv);
+        }
+        
+        const statusElUpdated = document.getElementById('temporalStatus');
+        if (isCurrentDay && isCurrentHour) {
+            statusElUpdated.textContent = '🟢 LIVE TRAFFIC ANALYSIS';
+            statusElUpdated.style.background = 'rgba(16, 185, 129, 0.1)';
+            statusElUpdated.style.color = '#10b981';
+            statusElUpdated.style.border = '1px solid rgba(16, 185, 129, 0.3)';
+        } else {
+            statusElUpdated.textContent = '📊 HISTORICAL TRAFFIC SIMULATION';
+            statusElUpdated.style.background = 'rgba(245, 158, 11, 0.1)';
+            statusElUpdated.style.color = '#f59e0b';
+            statusElUpdated.style.border = '1px solid rgba(245, 158, 11, 0.3)';
+        }
+    };
+    
+    // Initial status update
+    updateTemporalStatus();
+    
+    // Update status every minute to detect day/time changes
+    setInterval(updateTemporalStatus, 60000);
 });
