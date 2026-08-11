@@ -1,9 +1,10 @@
 {
   "appId": "com.trafficsense.ai",
   "appName": "TrafficSense AI",
-  "webDir": "../frontend",
+  "webDir": "public",
   "server": {
-    "androidScheme": "https"
+    "androidScheme": "https",
+    "cleartext": true
   },
   "plugins": {
     "SplashScreen": {
